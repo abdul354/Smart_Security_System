@@ -1,12 +1,17 @@
-import mediapipe as mp
 import cv2
 from backend.config import (
     DETECTION_MODEL_SELECTION,
     DETECTION_MIN_CONFIDENCE,
 )
 
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
+try:
+    import mediapipe as mp
+    mp_face_detection = mp.solutions.face_detection
+    mp_drawing = mp.solutions.drawing_utils
+except (AttributeError, ImportError):
+    # For newer mediapipe versions
+    from mediapipe.python.solutions import face_detection as mp_face_detection
+    from mediapipe.python.solutions import drawing_utils as mp_drawing
 
 face_detector = mp_face_detection.FaceDetection(
     model_selection=DETECTION_MODEL_SELECTION,

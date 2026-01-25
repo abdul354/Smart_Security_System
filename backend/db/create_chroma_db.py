@@ -15,7 +15,7 @@ def create_chroma_db():
     try:
         collection = client.get_collection(COLLECTION_NAME)
         print(f"Collection '{COLLECTION_NAME}' already exists.")
-    except chromadb.errors.NotFoundError:
+    except (ValueError, Exception):
         collection = client.create_collection(name=COLLECTION_NAME)
         print(f"Collection '{COLLECTION_NAME}' created successfully.")
 

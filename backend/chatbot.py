@@ -1,4 +1,3 @@
-import csv
 import json
 import os
 import re
@@ -7,7 +6,9 @@ from datetime import datetime, timedelta
 
 from groq import Groq
 
-from backend.config import PERSONS_CSV, ATTENDANCE_CSV
+from backend.supabase_db import SupabaseConfigError
+from backend.supabase_db import list_persons as _list_persons_supabase
+from backend.supabase_db import read_attendance as _read_attendance_supabase
 
 DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
 
@@ -31,13 +32,10 @@ def _parse_timestamp(value: str):
     return None
 
 
-def _load_csv(path: str):
-    if not os.path.exists(path):
-        return [], []
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        return reader.fieldnames or [], rows
+def _load_data_from_supabase():
+    persons = _list_persons_supabase()
+    attendance = _read_attendance_supabase(today_only=False)
+    return persons, attendance
 
 
 def _normalize(text: str):
@@ -261,8 +259,7 @@ def _build_context(question: str, memory, history):
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     today_str = now.strftime("%Y-%m-%d")
 
-    persons_header, persons = _load_csv(PERSONS_CSV)
-    _, attendance = _load_csv(ATTENDANCE_CSV)
+    persons, attendance = _load_data_from_supabase()
 
     range_key = _detect_range_key(question)
     range_label = _range_label(range_key)
@@ -293,7 +290,7 @@ def _build_context(question: str, memory, history):
                 }
                 for p in matches[:6]
             ],
-            "has_enrollment_timestamps": "enrolled_at" in (persons_header or []),
+            "has_enrollment_timestamps": True,
         },
         "attendance": {
             "rows": attendance,
@@ -318,9 +315,9 @@ def _ask_groq(question: str, context):
         "If the user greets you, greet back and ask how you can help. Not every time based on context"
         "The context includes persons.rows (enrollment records), attendance.rows (check-in logs), "
         "and conversation (recent chat history). "
-        "Interpret 'present' or 'enrolled' as being in persons.csv unless the question mentions "
+        "Interpret 'present' or 'enrolled' as being in enrollment records unless the question mentions "
         "attendance or 'checked in'. "
-        "For status questions, use access_status from persons.csv. "
+        "For status questions, use access_status from enrollment records. "
         "For time ranges (last hour, today, last week), compare timestamps to the provided 'now'. "
         "If enrollment timestamps are missing and a time-based enrollment question is asked, "
         "say you only have total enrolled. "
@@ -454,7 +451,13 @@ def _fallback_answer(context):
 
 
 def answer_chat(message: str, memory=None, history=None):
-    context = _build_context(message, memory or {}, history or [])
+    try:
+        context = _build_context(message, memory or {}, history or [])
+    except SupabaseConfigError:
+        return {
+            "answer": "Supabase is not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+            "meta": {"error": "missing_supabase_config"},
+        }
     meta = {}
 
     matches = context.get("persons", {}).get("fuzzy_matches", [])

@@ -22,6 +22,8 @@ from backend.config import (
 from backend.admin import list_persons, delete_person
 from backend.pose_validation import analyze_pose_and_draw, validate_expected_pose, POSES
 from backend.chatbot import answer_chat
+from backend.security import basic_auth_middleware
+from backend.rate_limit import rate_limit_middleware
 
 import cv2
 import numpy as np
@@ -31,6 +33,16 @@ import threading
 import uuid
 
 app = FastAPI(title="Smart Security System Backend")
+
+
+@app.middleware("http")
+async def _basic_auth(request: Request, call_next):
+    return await basic_auth_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    return await rate_limit_middleware(request, call_next)
 
 SESSION_TTL_SECONDS = 30 * 60
 SESSION_MAX_TURNS = 8

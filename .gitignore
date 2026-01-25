@@ -19,8 +19,7 @@ chroma/
 *.sqlite3
 chromadb_data/
 
-
-# CSV data
+# Legacy CSV data (no longer used)
 persons.csv
 attendance.csv
 
