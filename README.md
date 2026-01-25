@@ -54,6 +54,11 @@ python backend/db/create_chroma_db.py
 
 ## Run
 
+### One-file launcher (recommended)
+```bash
+python run_server.py --open --init-chroma
+```
+
 ### Development server
 ```bash
 python -m uvicorn main:app --host 127.0.0.1 --port 8001
