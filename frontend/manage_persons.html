@@ -223,13 +223,6 @@ button.delete-btn:hover {
 </div>
 
 <script>
-// Stop camera when this page loads
-async function stopCamera() {
-    await fetch("/camera/stop", { method: "POST" });
-}
-
-stopCamera();
-
 async function loadPersons() {
     const res = await fetch("/admin/persons");
     const data = await res.json();

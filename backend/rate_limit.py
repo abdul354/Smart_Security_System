@@ -42,6 +42,11 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _is_localhost(ip: str) -> bool:
+    # Common loopback values.
+    return ip in {"127.0.0.1", "::1", "localhost"}
+
+
 def _prune_and_count(bucket: Deque[float], now: float, window_seconds: float) -> int:
     cutoff = now - window_seconds
     while bucket and bucket[0] < cutoff:
@@ -79,7 +84,7 @@ def _rate_limited(rule: Rule) -> Response:
 
 async def rate_limit_middleware(request: Request, call_next):
     chat_limit = _env_int("RATE_LIMIT_CHAT_PER_MIN", 20)
-    video_limit = _env_int("RATE_LIMIT_VIDEO_PER_MIN", 5)
+    video_limit = _env_int("RATE_LIMIT_VIDEO_PER_MIN", 30)
 
     path = request.url.path
     method = request.method.upper()
@@ -93,6 +98,11 @@ async def rate_limit_middleware(request: Request, call_next):
     if rule is not None:
         now = time.time()
         ip = _client_ip(request)
+
+        # Don't rate-limit localhost by default (dev UX). Keep protection for LAN/remote.
+        if _is_localhost(ip):
+            return await call_next(request)
+
         if not _check(rule, ip, now):
             return _rate_limited(rule)
 

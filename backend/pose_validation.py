@@ -7,10 +7,11 @@ mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 
 _face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=True,
+    # Video stream: enable tracking for more stable pose estimates.
+    static_image_mode=False,
     max_num_faces=1,
     refine_landmarks=True,
-    min_detection_confidence=0.6,
+    min_detection_confidence=0.5,
     min_tracking_confidence=0.5,
 )
 
@@ -18,12 +19,7 @@ POSES = [
     "Look straight",
     "Turn left",
     "Turn right",
-    "Look up",
-    "Look down",
-    "Tilt head left",
-    "Tilt head right",
     "Smile",
-    "Neutral face",
     "Move slightly back",
 ]
 
@@ -114,77 +110,96 @@ def analyze_pose_and_draw(frame_bgr, draw=True):
 
     return True, landmarks, pose_deg, smile_score
 
-def validate_expected_pose(expected_pose: str, pose_deg, smile_ratio: float, face_box_area: int, frame_area: int):
+def validate_expected_pose(
+    expected_pose: str,
+    pose_deg,
+    smile_ratio: float,
+    face_box_area: int,
+    frame_area: int,
+    tolerance: float = 0.0,
+):
     if pose_deg is None:
         return False, "Pose estimation failed"
 
     pitch, yaw, roll = pose_deg
 
     # Wider straight window for noisy webcams.
-    STRAIGHT_YAW = 25
-    STRAIGHT_PITCH = 25
-    STRAIGHT_ROLL = 25
+    # Roll is especially noisy across cameras/face mesh fits, so we don't gate on it.
+    STRAIGHT_YAW = 75
+    STRAIGHT_PITCH = 60
 
-    TURN_YAW = 22
-    UP_PITCH = 15
-    DOWN_PITCH = 6
-    TILT_ROLL = 12
-    SMILE_MIN_RATIO = 4.0
-    NEUTRAL_MAX_RATIO = 4.6
+    TURN_YAW = 15
+    UP_PITCH = 10
+    DOWN_PITCH = 5
+    TILT_ROLL = 15
+    SMILE_MIN_RATIO = 3.6
+    NEUTRAL_MAX_RATIO = 5.0
 
     face_ratio = face_box_area / max(frame_area, 1)
     MOVE_BACK_MAX_RATIO = 0.20
 
+    tol = max(0.0, float(tolerance))
+    straight_yaw = STRAIGHT_YAW + 0.75 * tol
+    straight_pitch = STRAIGHT_PITCH + 0.75 * tol
+    turn_yaw = max(4.0, TURN_YAW - 0.6 * tol)
+    up_pitch = max(4.0, UP_PITCH - 0.5 * tol)
+    down_pitch = max(2.5, DOWN_PITCH - 0.4 * tol)
+    tilt_roll = max(7.0, TILT_ROLL - 0.7 * tol)
+    smile_min = max(2.5, SMILE_MIN_RATIO - 0.3 * tol)
+    neutral_max = NEUTRAL_MAX_RATIO + 0.3 * tol
+    move_back_ratio = MOVE_BACK_MAX_RATIO + min(0.08, 0.015 * tol)
+
     ep = expected_pose.lower()
 
     if ep == "look straight":
-        if abs(yaw) < STRAIGHT_YAW and abs(pitch) < STRAIGHT_PITCH and abs(roll) < STRAIGHT_ROLL:
+        # Only gate on yaw/pitch; roll is too noisy for a strict check.
+        if abs(yaw) < straight_yaw and abs(pitch) < straight_pitch:
             return True, "OK"
         return False, "Look straight (center head)"
 
     if ep == "turn left":
-        if yaw < -TURN_YAW:
+        if yaw < -turn_yaw:
             return True, "OK"
         return False, "Turn LEFT more"
 
     if ep == "turn right":
-        if yaw > TURN_YAW:
+        if yaw > turn_yaw:
             return True, "OK"
         return False, "Turn RIGHT more"
 
     if ep == "look up":
-        if pitch < -UP_PITCH:
+        if pitch < -up_pitch:
             return True, "OK"
         return False, "Look UP more"
 
     if ep == "look down":
-        if pitch > DOWN_PITCH:
+        if pitch > down_pitch:
             return True, "OK"
         return False, "Look DOWN more"
 
     if ep == "tilt head left":
-        if roll < -TILT_ROLL:
+        if roll < -tilt_roll:
             return True, "OK"
         return False, "Tilt LEFT more"
 
     if ep == "tilt head right":
-        if roll > TILT_ROLL:
+        if roll > tilt_roll:
             return True, "OK"
         return False, "Tilt RIGHT more"
 
     # Bigger smile_ratio means more smile-like.
     if ep == "smile":
-        if smile_ratio > SMILE_MIN_RATIO:
+        if smile_ratio > smile_min:
             return True, "OK"
         return False, "Smile clearly"
 
     if ep == "neutral face":
-        if smile_ratio <= NEUTRAL_MAX_RATIO:
+        if smile_ratio <= neutral_max:
             return True, "OK"
         return False, "Neutral face"
 
     if ep == "move slightly back":
-        if face_ratio < MOVE_BACK_MAX_RATIO:
+        if face_ratio < move_back_ratio:
             return True, "OK"
         return False, "Move slightly back"
 

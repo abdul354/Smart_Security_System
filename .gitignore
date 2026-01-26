@@ -6,6 +6,7 @@ __pycache__/
 .env
 venv/
 env/
+.venv/
 
 # FastAPI / runtime
 *.log
@@ -34,3 +35,9 @@ node_modules/
 *.mp4
 *.avi
 *.mov
+
+# Model artifacts / downloads
+backend/models/*.onnx.bak
+backend/models/*.previous.onnx
+backend/models/*.tmp
+backend/models/arcfaceresnet100-8.onnx

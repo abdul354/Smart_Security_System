@@ -520,8 +520,6 @@ function exitSystem() {
             window.location.href = "/";
         });
 }
-
-fetch("/camera/stop", { method: "POST" }).catch(() => {});
 appendMessage("bot", "Hello! Ask me about enrollments, attendance logs, or today's date.");
 </script>
 </body>

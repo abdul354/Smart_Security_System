@@ -8,22 +8,28 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from backend.camera import VideoCamera
 from backend.detection import detect_faces
-from backend.embedding import get_embedding
+from backend.embedding import get_embedding, get_embeddings
 from backend.recognition import recognize_face
 from backend.enrollment import generate_person_id, add_embedding, finalize_enrollment, CURRENT_SESSION
 from backend.attendance import log_attendance, read_attendance
-from backend.quality import face_quality
+from backend.quality import face_quality, face_quality_details
 from backend.config import (
     DETECTION_ENHANCE,
     DETECTION_UPSCALE,
     DETECTION_FRAME_SKIP,
     DETECTION_HOLD_FRAMES,
+    SAMPLES_REQUIRED,
+    ENROLL_BURST_FRAMES,
+    ENROLL_BURST_DELAY_SECONDS,
+    ENROLL_BURST_MIN_ACCEPTED,
+    ENROLL_DUPLICATE_DISTANCE,
 )
 from backend.admin import list_persons, delete_person
 from backend.pose_validation import analyze_pose_and_draw, validate_expected_pose, POSES
 from backend.chatbot import answer_chat
 from backend.security import basic_auth_middleware
 from backend.rate_limit import rate_limit_middleware
+from backend.metrics import record as record_metric, snapshot as metrics_snapshot
 
 import cv2
 import numpy as np
@@ -31,8 +37,13 @@ import time
 import atexit
 import threading
 import uuid
+import logging
+from collections import deque
+import traceback
 
 app = FastAPI(title="Smart Security System Backend")
+
+logger = logging.getLogger("smart_security")
 
 
 @app.middleware("http")
@@ -79,7 +90,14 @@ LAST_RECOGNITIONS = []
 LAST_RECOGNITION_TIME = 0
 STATE_LOCK = threading.Lock()
 
-CAMERA_ACTIVE = True
+RECENT_RECOGNITION_CACHE = []
+RECENT_RECOGNITION_WINDOW = 1.5  # seconds
+SMOOTHING_DISTANCE_PX = 80
+
+# Camera streaming coordination
+CAMERA_STOP_EVENT = threading.Event()
+ACTIVE_STREAMS = 0
+STREAMS_LOCK = threading.Lock()
 
 RECOGNITION_COOLDOWN = 0.5  # seconds
 LAST_RECOGNITION_RUN = 0
@@ -87,6 +105,9 @@ LAST_RECOGNITION_RUN = 0
 FACE_TRACKERS = {}  # key: tracker_id, value: tracker object
 TRACKER_ID_COUNTER = 0
 TRACKER_RECOGNITIONS = {}  # key: tracker_id, value: recognition info
+
+POSE_ACCEPT_STREAK = 1
+POSE_ACCEPT_STREAK_BASELINE = 2
 
 # Ensure camera released on exit
 def cleanup():
@@ -107,121 +128,232 @@ def release_camera():
         camera = None
 
 
+def _match_recent_recognition(center):
+    now = time.time()
+    cx, cy = center
+    keep = []
+    best = None
+    for entry in RECENT_RECOGNITION_CACHE:
+        age = now - entry["timestamp"]
+        if age > RECENT_RECOGNITION_WINDOW:
+            continue
+        keep.append(entry)
+        ex, ey = entry["center"]
+        if best is not None:
+            continue
+        if abs(cx - ex) <= SMOOTHING_DISTANCE_PX and abs(cy - ey) <= SMOOTHING_DISTANCE_PX:
+            best = entry["data"].copy()
+    RECENT_RECOGNITION_CACHE[:] = keep
+    return best
+
+
+def _remember_recognition(center, data):
+    RECENT_RECOGNITION_CACHE.append({
+        "center": center,
+        "timestamp": time.time(),
+        "data": data.copy(),
+    })
+
+
 # MJPEG Video Stream
 def gen_frames():
     frame_count = 0
-    global LAST_FRAME, CAMERA_ACTIVE, LAST_RECOGNITIONS, LAST_RECOGNITION_TIME, LAST_BOXES, LAST_BOXES_AGE
+    global LAST_FRAME, LAST_RECOGNITIONS, LAST_RECOGNITION_TIME, LAST_BOXES, LAST_BOXES_AGE, ACTIVE_STREAMS
 
-    while CAMERA_ACTIVE:
-        cam = get_camera()
-        frame = cam.get_frame()
-        if frame is None:
-            continue
+    with STREAMS_LOCK:
+        ACTIVE_STREAMS += 1
 
-        with STATE_LOCK:
-            LAST_FRAME = frame.copy()
+    try:
+        while not CAMERA_STOP_EVENT.is_set():
+            try:
+                cam = get_camera()
+            except Exception as exc:
+                logger.warning("Camera open failed; retrying: %s", exc)
+                time.sleep(0.5)
+                continue
 
-        frame_count += 1
+            frame = cam.get_frame()
+            if frame is None:
+                time.sleep(0.02)
+                continue
 
-        # Detect faces every N frames; keep last boxes briefly if detection misses.
-        if frame_count % DETECTION_FRAME_SKIP == 0:
-            detected = detect_faces(
-                frame,
-                enhance=DETECTION_ENHANCE,
-                upscale=DETECTION_UPSCALE
-            )
-            with STATE_LOCK:
-                if detected:
-                    LAST_BOXES = detected
-                    LAST_BOXES_AGE = 0
-                else:
-                    LAST_BOXES_AGE += 1
-                    if LAST_BOXES_AGE > DETECTION_HOLD_FRAMES:
-                        LAST_BOXES = []
+            try:
+                loop_start = time.perf_counter()
+                with STATE_LOCK:
+                    LAST_FRAME = frame.copy()
 
-        boxes = LAST_BOXES
-        current_recognitions = []
+                frame_count += 1
 
-        for x, y, w, h in boxes:
-            color = (0, 0, 255)
-            label = "Unknown"
+                # Detect faces every N frames; keep last boxes briefly if detection misses.
+                if frame_count % DETECTION_FRAME_SKIP == 0:
+                    detect_start = time.perf_counter()
+                    detected = detect_faces(
+                        frame,
+                        enhance=DETECTION_ENHANCE,
+                        upscale=DETECTION_UPSCALE,
+                    )
+                    record_metric("detection.latency_ms", (time.perf_counter() - detect_start) * 1000.0)
+                    with STATE_LOCK:
+                        if detected:
+                            LAST_BOXES = detected
+                            LAST_BOXES_AGE = 0
+                        else:
+                            LAST_BOXES_AGE += 1
+                            if LAST_BOXES_AGE > DETECTION_HOLD_FRAMES:
+                                LAST_BOXES = []
 
-            if SYSTEM_MODE == "recognition":
-                # Safe crop
-                x1, y1 = max(0, x), max(0, y)
-                x2, y2 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
-                face = frame[y1:y2, x1:x2]
+                boxes = LAST_BOXES
+                current_recognitions = []
 
-                if face.size == 0:
-                    continue
+                recognition_results = [None] * len(boxes)
+                if SYSTEM_MODE == "recognition" and boxes:
+                    faces_payload = []
+                    for idx, (x, y, w, h) in enumerate(boxes):
+                        x1, y1 = max(0, x), max(0, y)
+                        x2, y2 = min(frame.shape[1], x + w), min(frame.shape[0], y + h)
+                        if x2 <= x1 or y2 <= y1:
+                            continue
+                        face = frame[y1:y2, x1:x2]
+                        if face.size == 0:
+                            continue
+                        faces_payload.append((idx, (x + w / 2.0, y + h / 2.0), face))
 
-                emb = get_embedding(face)
-                person, dist = recognize_face(emb)
+                    if faces_payload:
+                        emb_start = time.perf_counter()
+                        embeddings = get_embeddings([fp[2] for fp in faces_payload])
+                        record_metric("embedding.latency_ms", (time.perf_counter() - emb_start) * 1000.0)
+                        for (idx, center, _face), emb in zip(faces_payload, embeddings):
+                            entry_data = {
+                                "person_id": None,
+                                "display_name": "Unknown",
+                                "role": "",
+                                "access_status": "",
+                                "distance": None,
+                            }
+                            label = "Unknown"
+                            color = (0, 0, 255)
 
-                if person:
-                    label = person["display_name"]
-                    color = (0, 255, 0)
-                    current_recognitions.append({
-                        "person_id": person["person_id"],
-                        "display_name": person["display_name"],
-                        "role": person["role"],
-                        "access_status": person["access_status"],
-                        "distance": float(dist) if dist is not None else None
-                    })
-                else:
-                    current_recognitions.append({
-                        "person_id": None,
-                        "display_name": "Unknown",
-                        "role": "",
-                        "access_status": "",
-                        "distance": None
-                    })
+                            if emb is None:
+                                label = "Embedding model error"
+                                color = (0, 165, 255)
+                            else:
+                                person, dist = recognize_face(emb)
+                                if person:
+                                    entry_data.update(
+                                        {
+                                            "person_id": person["person_id"],
+                                            "display_name": person["display_name"],
+                                            "role": person["role"],
+                                            "access_status": person["access_status"],
+                                            "distance": float(dist) if dist is not None else None,
+                                        }
+                                    )
+                                    label = person["display_name"]
+                                    color = (0, 255, 0)
+                                    _remember_recognition(center, entry_data)
+                                else:
+                                    if dist is not None:
+                                        entry_data["distance"] = float(dist)
+                                    cached = _match_recent_recognition(center)
+                                    if cached:
+                                        entry_data = cached
+                                        label = cached["display_name"]
+                                        color = (0, 200, 0)
 
-            elif SYSTEM_MODE == "enrollment":
-                pose_index = CURRENT_SESSION.get("count", 0)
-                expected_pose = POSES[min(pose_index, len(POSES) - 1)]
+                            recognition_results[idx] = {
+                                "label": label,
+                                "color": color,
+                                "info": entry_data,
+                            }
 
-                ok, _, pose_deg, smile_ratio = analyze_pose_and_draw(frame_bgr=frame, draw=True)
+                for idx, (x, y, w, h) in enumerate(boxes):
+                    color = (0, 0, 255)
+                    label = "Unknown"
 
-                label = f"{expected_pose} ({pose_index + 1}/10)" if pose_index < 10 else "Capture complete"
-                color = (255, 255, 0)
+                    if SYSTEM_MODE == "recognition":
+                        result = recognition_results[idx]
+                        if result is not None:
+                            label = result["label"]
+                            color = result["color"]
+                            current_recognitions.append(result["info"])
+                        else:
+                            current_recognitions.append(
+                                {
+                                    "person_id": None,
+                                    "display_name": "Unknown",
+                                    "role": "",
+                                    "access_status": "",
+                                    "distance": None,
+                                }
+                            )
 
-                if pose_deg:
-                    pitch, yaw, roll = pose_deg
+                    elif SYSTEM_MODE == "enrollment":
+                        pose_index = CURRENT_SESSION.get("count", 0)
+                        expected_pose = POSES[min(pose_index, len(POSES) - 1)]
+
+                        ok, _, pose_deg, smile_ratio = analyze_pose_and_draw(frame_bgr=frame, draw=True)
+
+                        label = (
+                            f"{expected_pose} ({pose_index + 1}/{SAMPLES_REQUIRED})"
+                            if pose_index < SAMPLES_REQUIRED
+                            else "Capture complete"
+                        )
+                        color = (255, 255, 0)
+
+                        if pose_deg:
+                            pitch, yaw, roll = pose_deg
+                            pitch = fold_angle(pitch)
+                            yaw = fold_angle(yaw)
+                            roll = fold_angle(roll)
+                            cv2.putText(
+                                frame,
+                                f"pitch={pitch:.1f} yaw={yaw:.1f} roll={roll:.1f}",
+                                (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                (255, 255, 0),
+                                2,
+                            )
+
+                    # Draw box and label
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     cv2.putText(
                         frame,
-                        f"pitch={pitch:.1f} yaw={yaw:.1f} roll={roll:.1f}",
-                        (10, 30),
+                        label,
+                        (x, y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 0),
-                        2
+                        0.6,
+                        color,
+                        2,
                     )
 
-            # Draw box and label
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            cv2.putText(
-                frame,
-                label,
-                (x, y - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2
-            )
+                if current_recognitions:
+                    with STATE_LOCK:
+                        LAST_RECOGNITIONS = current_recognitions
+                        LAST_RECOGNITION_TIME = time.time()
 
-        if current_recognitions:
-            with STATE_LOCK:
-                LAST_RECOGNITIONS = current_recognitions
-                LAST_RECOGNITION_TIME = time.time()
+                ok, buffer = cv2.imencode(".jpg", frame)
+                if not ok or buffer is None:
+                    logger.warning("cv2.imencode failed; skipping frame")
+                    time.sleep(0.01)
+                    continue
 
-        _, buffer = cv2.imencode(".jpg", frame)
-        yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + buffer.tobytes() +
-            b"\r\n"
-        )
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+                )
+                record_metric("frame.loop_ms", (time.perf_counter() - loop_start) * 1000.0)
+            except Exception:
+                logger.exception("Frame loop error; continuing")
+                time.sleep(0.05)
+                continue
+    finally:
+        should_release = False
+        with STREAMS_LOCK:
+            ACTIVE_STREAMS = max(0, ACTIVE_STREAMS - 1)
+            should_release = ACTIVE_STREAMS == 0
+        if should_release:
+            release_camera()
 
 
 def expand_box(x, y, w, h, frame_w, frame_h, margin=0.35):
@@ -239,11 +371,22 @@ def norm180(a: float) -> float:
     return (a + 180.0) % 360.0 - 180.0
 
 
+def fold_angle(a: float) -> float:
+    """Fold a pose angle into a stable range around 0.
+
+    Head pose estimates can occasionally flip and report values near +/-180 for a
+    forward-facing head. This makes straight-pose checks fail. Folding maps those
+    cases back near 0.
+    """
+    a = norm180(float(a))
+    if abs(a) > 90.0:
+        a = norm180(a - 180.0)
+    return float(a)
+
+
 @app.post("/camera/stop")
 async def camera_stop():
-    global CAMERA_ACTIVE
-
-    CAMERA_ACTIVE = False
+    CAMERA_STOP_EVENT.set()
     release_camera()
 
     return {"status": "stopped"}
@@ -265,9 +408,7 @@ async def set_system_mode(mode: str):
 
 @app.get("/video_feed")
 def video_feed():
-    global CAMERA_ACTIVE
-
-    CAMERA_ACTIVE = True
+    CAMERA_STOP_EVENT.clear()
     return StreamingResponse(
         gen_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame"
@@ -292,7 +433,8 @@ async def recognition_live():
     attendance = read_attendance()
     return JSONResponse({
         "faces": faces,
-        "attendance": attendance
+        "attendance": attendance,
+        "metrics": metrics_snapshot(),
     })
 
 
@@ -316,15 +458,31 @@ async def enroll_capture():
     - Requires minimum face quality
     - Calibrates "Look straight" baseline
     - Validates expected pose for current step
-    - Requires pose to be valid for 2 consecutive calls
+    - Requires pose to be valid (single stable call)
     """
+    try:
+        return _enroll_capture_impl()
+    except Exception as exc:
+        logger.exception("enroll_capture failed")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "message": "Internal server error",
+                "detail": str(exc),
+                "trace": traceback.format_exc(),
+            },
+        )
+
+
+def _enroll_capture_impl():
     global OVERLAY_MESSAGE, OVERLAY_COLOR
 
     with STATE_LOCK:
         frame = None if LAST_FRAME is None else LAST_FRAME.copy()
     if frame is None:
         OVERLAY_MESSAGE = "Camera not ready"
-        return {"status": "error", "message": OVERLAY_MESSAGE}
+        return {"status": "error", "message": OVERLAY_MESSAGE, "samples_required": SAMPLES_REQUIRED}
 
     boxes = detect_faces(
         frame,
@@ -334,12 +492,13 @@ async def enroll_capture():
     if len(boxes) != 1:
         OVERLAY_MESSAGE = "Ensure exactly ONE face"
         CURRENT_SESSION["valid_streak"] = 0
-        return {"status": "error", "message": OVERLAY_MESSAGE}
+        return {"status": "error", "message": OVERLAY_MESSAGE, "samples_required": SAMPLES_REQUIRED}
 
     x, y, w, h = boxes[0]
 
     fh, fw = frame.shape[:2]
-    ex1, ey1, ex2, ey2 = expand_box(x, y, w, h, fw, fh, margin=0.45)
+    # FaceMesh needs more context than embedding crop; use a larger margin.
+    ex1, ey1, ex2, ey2 = expand_box(x, y, w, h, fw, fh, margin=0.75)
     face_for_mesh = frame[ey1:ey2, ex1:ex2]
 
     x1, y1 = max(0, x), max(0, y)
@@ -349,30 +508,50 @@ async def enroll_capture():
     if face.size == 0 or face_for_mesh.size == 0:
         OVERLAY_MESSAGE = "Invalid face crop"
         CURRENT_SESSION["valid_streak"] = 0
-        return {"status": "error", "message": OVERLAY_MESSAGE}
+        return {"status": "error", "message": OVERLAY_MESSAGE, "samples_required": SAMPLES_REQUIRED}
 
+    # Ensure mediapipe gets a contiguous uint8 image.
+    face_for_mesh = np.ascontiguousarray(face_for_mesh)
     face_for_mesh = cv2.resize(face_for_mesh, (320, 320))
 
-    quality = face_quality(face)
+    q = face_quality_details(face)
+    quality = int(q["score"])
     if quality < 2:
         OVERLAY_MESSAGE = "Low Face Quality"
         CURRENT_SESSION["valid_streak"] = 0
-        return {"status": "error", "message": OVERLAY_MESSAGE, "quality": quality}
+        return {
+            "status": "error",
+            "message": OVERLAY_MESSAGE,
+            "quality": quality,
+            "quality_details": q,
+            "samples_required": SAMPLES_REQUIRED,
+        }
 
     pose_index = int(CURRENT_SESSION.get("count", 0))
     expected_pose = POSES[min(pose_index, len(POSES) - 1)]
 
     ok, _, pose_deg, smile_ratio = analyze_pose_and_draw(frame_bgr=face_for_mesh, draw=False)
     if not ok or pose_deg is None:
-        return {
-            "status": "error",
-            "message": "Align face (mesh not detected)",
-            "mesh_crop_shape": list(face_for_mesh.shape),
-            "det_crop_shape": list(face.shape),
-            "quality": quality
-        }
+        # Fallback: sometimes FaceMesh fails on tight crops; try the full frame.
+        ok2, _, pose_deg2, smile_ratio2 = analyze_pose_and_draw(frame_bgr=frame, draw=False)
+        if not ok2 or pose_deg2 is None:
+            return {
+                "status": "error",
+                "message": "Align face (mesh not detected)",
+                "mesh_crop_shape": list(face_for_mesh.shape),
+                "det_crop_shape": list(face.shape),
+                "quality": quality,
+                "samples_required": SAMPLES_REQUIRED,
+            }
+        pose_deg = pose_deg2
+        smile_ratio = smile_ratio2
 
     pitch, yaw, roll = pose_deg
+    pitch = fold_angle(pitch)
+    yaw = fold_angle(yaw)
+    roll = fold_angle(roll)
+
+    baseline_notice = None
 
     if "pose_center" not in CURRENT_SESSION:
         CURRENT_SESSION["pose_center"] = None
@@ -380,36 +559,65 @@ async def enroll_capture():
         CURRENT_SESSION["pose_center_samples"] = []
     if "valid_streak" not in CURRENT_SESSION:
         CURRENT_SESSION["valid_streak"] = 0
+    if "pose_history" not in CURRENT_SESSION or CURRENT_SESSION["pose_history"] is None:
+        CURRENT_SESSION["pose_history"] = deque(maxlen=6)
+    elif not isinstance(CURRENT_SESSION["pose_history"], deque):
+        CURRENT_SESSION["pose_history"] = deque(list(CURRENT_SESSION["pose_history"] or []), maxlen=6)
 
     if CURRENT_SESSION["pose_center"] is None and CURRENT_SESSION["count"] == 0:
-        CURRENT_SESSION["pose_center_samples"].append((pitch, yaw, roll))
+        # Robust baseline calibration: collect a small window and require low variance.
+        # This avoids setting a bad baseline that prevents step 1 from ever passing.
+        samples = CURRENT_SESSION.get("pose_center_samples")
+        if samples is None:
+            samples = []
+            CURRENT_SESSION["pose_center_samples"] = samples
 
-        if len(CURRENT_SESSION["pose_center_samples"]) >= 3:
-            arr = np.array(CURRENT_SESSION["pose_center_samples"], dtype=np.float64)
-            center = tuple(np.mean(arr, axis=0).tolist())
-            CURRENT_SESSION["pose_center"] = center
-            CURRENT_SESSION["pose_center_samples"] = []
-            CURRENT_SESSION["valid_streak"] = 0
+        samples.append((float(pitch), float(yaw), float(roll)))
+        # Keep a rolling window (last 10 frames)
+        if len(samples) > 10:
+            del samples[0 : len(samples) - 10]
 
-            OVERLAY_MESSAGE = "Baseline set. Look straight to capture."
+        # Need a few frames before we can judge stability.
+        if len(samples) < 5:
+            OVERLAY_MESSAGE = "Hold still - calibrating (look straight)"
             return {
                 "status": "calibrating",
                 "message": OVERLAY_MESSAGE,
                 "quality": quality,
                 "pose_deg": (pitch, yaw, roll),
                 "smile_ratio": float(smile_ratio),
+                "samples_required": SAMPLES_REQUIRED,
+                "calibrating": True,
+                "calib_count": len(samples),
             }
 
-        OVERLAY_MESSAGE = "Hold still - calibrating (look straight)"
-        return {
-            "status": "calibrating",
-            "message": OVERLAY_MESSAGE,
-            "quality": quality,
-            "pose_deg": (pitch, yaw, roll),
-            "smile_ratio": float(smile_ratio),
-            "calibrating": True,
-            "calib_count": len(CURRENT_SESSION["pose_center_samples"]),
-        }
+        arr = np.array(samples, dtype=np.float64)
+        std = np.std(arr, axis=0)
+        # If the head is moving, keep calibrating.
+        if float(np.max(std)) > 7.0:
+            OVERLAY_MESSAGE = "Hold still - calibrating"
+            return {
+                "status": "calibrating",
+                "message": OVERLAY_MESSAGE,
+                "quality": quality,
+                "pose_deg": (pitch, yaw, roll),
+                "smile_ratio": float(smile_ratio),
+                "samples_required": SAMPLES_REQUIRED,
+                "calibrating": True,
+                "calib_count": len(samples),
+                "pose_std": (float(std[0]), float(std[1]), float(std[2])),
+            }
+
+        center = tuple(np.mean(arr, axis=0).tolist())
+        CURRENT_SESSION["pose_center"] = center
+        CURRENT_SESSION["pose_center_samples"] = []
+        CURRENT_SESSION["valid_streak"] = 0
+        CURRENT_SESSION["pose_history"] = deque(maxlen=6)
+
+        # Baseline is set; continue in this same request to validate and capture the
+        # first ("look straight") sample. This prevents getting stuck showing the
+        # baseline message while never incrementing the sample count.
+        baseline_notice = "Baseline set. Keep looking straight."
 
     center = CURRENT_SESSION.get("pose_center")
     if center is not None:
@@ -417,21 +625,33 @@ async def enroll_capture():
         yaw -= center[1]
         roll -= center[2]
 
-    pitch = norm180(pitch)
-    yaw = norm180(yaw)
-    roll = norm180(roll)
+    pitch = fold_angle(pitch)
+    yaw = fold_angle(yaw)
+    roll = fold_angle(roll)
 
     pose_deg_centered = (float(pitch), float(yaw), float(roll))
 
+    pose_history = CURRENT_SESSION.get("pose_history")
+    if not isinstance(pose_history, deque):
+        pose_history = deque(pose_history or [], maxlen=6)
+        CURRENT_SESSION["pose_history"] = pose_history
+    pose_history.append(pose_deg_centered)
+    if len(pose_history) >= 2:
+        arr_hist = np.array(pose_history, dtype=np.float32)
+        pose_deg_centered = tuple(float(v) for v in np.median(arr_hist, axis=0))
+
     face_area = w * h
     frame_area = frame.shape[0] * frame.shape[1]
+
+    tolerance = min(8.0, 1.5 * float(CURRENT_SESSION.get("valid_streak", 0)))
 
     is_valid, msg = validate_expected_pose(
         expected_pose=expected_pose,
         pose_deg=pose_deg_centered,
         smile_ratio=float(smile_ratio),
         face_box_area=face_area,
-        frame_area=frame_area
+        frame_area=frame_area,
+        tolerance=tolerance,
     )
 
     if not is_valid:
@@ -444,44 +664,118 @@ async def enroll_capture():
             "quality": quality,
             "pose_deg": pose_deg_centered,
             "smile_ratio": float(smile_ratio),
+            "samples_required": SAMPLES_REQUIRED,
         }
 
-    CURRENT_SESSION["valid_streak"] += 1
-    if CURRENT_SESSION["valid_streak"] < 2:
-        OVERLAY_MESSAGE = "Good - hold it"
+    CURRENT_SESSION["valid_streak"] = int(CURRENT_SESSION.get("valid_streak", 0)) + 1
+    required_streak = POSE_ACCEPT_STREAK_BASELINE if (
+        CURRENT_SESSION.get("count", 0) == 0 and expected_pose.lower() == "look straight"
+    ) else POSE_ACCEPT_STREAK
+
+    if CURRENT_SESSION["valid_streak"] < required_streak:
+        OVERLAY_MESSAGE = "Hold steady - locking pose"
         return {
-            "status": "error",
+            "status": "steady",
             "message": OVERLAY_MESSAGE,
             "expected_pose": expected_pose,
             "quality": quality,
             "pose_deg": pose_deg_centered,
             "smile_ratio": float(smile_ratio),
+            "samples_required": SAMPLES_REQUIRED,
+            "streak": CURRENT_SESSION["valid_streak"],
+            "streak_required": required_streak,
         }
 
-    CURRENT_SESSION["valid_streak"] = 0
+    # Capture a short burst and average embeddings for stability.
+    probe = get_embedding(face)
+    if probe is None:
+        OVERLAY_MESSAGE = "Embedding model not ready/invalid"
+        CURRENT_SESSION["valid_streak"] = 0
+        return {
+            "status": "error",
+            "message": OVERLAY_MESSAGE,
+            "hint": "Check backend/models/facenet.onnx is an embedding model (output should be (1,128) or similar).",
+            "samples_required": SAMPLES_REQUIRED,
+        }
 
-    emb = get_embedding(face)
+    embeddings = [probe]
+    for i in range(1, int(ENROLL_BURST_FRAMES)):
+        with STATE_LOCK:
+            frame_i = None if LAST_FRAME is None else LAST_FRAME.copy()
+        if frame_i is None:
+            break
+
+        fh_i, fw_i = frame_i.shape[:2]
+        x1_i, y1_i = max(0, x), max(0, y)
+        x2_i, y2_i = min(fw_i, x + w), min(fh_i, y + h)
+        face_i = frame_i[y1_i:y2_i, x1_i:x2_i]
+        if face_i.size == 0:
+            continue
+
+        q_i = face_quality_details(face_i)
+        if int(q_i["score"]) < 2:
+            continue
+
+        emb_i = get_embedding(face_i)
+        if emb_i is None:
+            continue
+        embeddings.append(emb_i)
+
+        if i < int(ENROLL_BURST_FRAMES) - 1:
+            time.sleep(float(ENROLL_BURST_DELAY_SECONDS))
+
+    if len(embeddings) < int(ENROLL_BURST_MIN_ACCEPTED):
+        OVERLAY_MESSAGE = "Hold still (capture too noisy)"
+        CURRENT_SESSION["valid_streak"] = 0
+        return {
+            "status": "error",
+            "message": OVERLAY_MESSAGE,
+            "quality": quality,
+            "quality_details": q,
+            "samples_required": SAMPLES_REQUIRED,
+            "burst_collected": len(embeddings),
+            "burst_required": int(ENROLL_BURST_MIN_ACCEPTED),
+        }
+
+    emb = np.mean(np.stack(embeddings, axis=0), axis=0)
+    norm = float(np.linalg.norm(emb))
+    if not np.isfinite(norm) or norm <= 0:
+        OVERLAY_MESSAGE = "Embedding failed"
+        CURRENT_SESSION["valid_streak"] = 0
+        return {"status": "error", "message": OVERLAY_MESSAGE, "samples_required": SAMPLES_REQUIRED}
+    emb = emb / norm
 
     person, dist = recognize_face(emb)
-    if person and dist is not None and dist < 0.6:
+    if person and dist is not None and dist < float(ENROLL_DUPLICATE_DISTANCE):
         OVERLAY_MESSAGE = "Person already exists. Restarting."
         generate_person_id()
         CURRENT_SESSION["pose_center"] = None
         CURRENT_SESSION["pose_center_samples"] = []
         CURRENT_SESSION["valid_streak"] = 0
-        return {"status": "duplicate", "message": OVERLAY_MESSAGE}
+        return {"status": "duplicate", "message": OVERLAY_MESSAGE, "samples_required": SAMPLES_REQUIRED}
 
     OVERLAY_MESSAGE = ""
-    done, count = add_embedding(emb)
+    try:
+        done, count = add_embedding(emb)
+    except Exception as exc:
+        OVERLAY_MESSAGE = f"Enrollment failed: {exc}"
+        return {"status": "error", "message": OVERLAY_MESSAGE, "samples_required": SAMPLES_REQUIRED}
+
+    CURRENT_SESSION["valid_streak"] = 0
+    CURRENT_SESSION["pose_history"] = deque(maxlen=6)
 
     return {
         "status": "ok",
         "done": done,
         "count": count,
         "quality": quality,
+        "quality_details": q,
         "expected_pose": expected_pose,
         "pose_deg": pose_deg_centered,
         "smile_ratio": float(smile_ratio),
+        "samples_required": SAMPLES_REQUIRED,
+        "burst_collected": len(embeddings),
+        "notice": baseline_notice,
     }
 
 

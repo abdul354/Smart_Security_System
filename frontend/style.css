@@ -220,7 +220,8 @@ button:hover {
 /* --- Overlay Message --- */
 .overlay-message {
     position: absolute;
-    top: 20px;
+    top: auto;
+    bottom: 20px;
     left: 50%;
     transform: translateX(-50%);
     background: rgba(0,0,0,0.7);

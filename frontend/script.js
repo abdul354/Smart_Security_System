@@ -11,12 +11,7 @@ const poses = [
     "Look straight",
     "Turn left",
     "Turn right",
-    "Look up",
-    "Look down",
-    "Tilt head left",
-    "Tilt head right",
     "Smile",
-    "Neutral face",
     "Move slightly back"
 ];
 
@@ -30,6 +25,23 @@ window.addEventListener("load", () => {
 // });
 
 fetch("/system/mode/recognition", { method: "POST" });
+
+async function setMode(mode, opts = {}) {
+    const { stopEnrollment = true } = opts;
+
+    const video = document.getElementById("videoStream");
+    if (video) video.src = "";
+
+    hideOverlay();
+    if (stopEnrollment) {
+        enrollmentActive = false;
+    }
+
+    updateModeUI(mode);
+    await fetch(`/system/mode/${mode}`, { method: "POST" });
+
+    if (video) video.src = "/video_feed";
+}
 
 function exitSystem() {
     fetch("/camera/stop", { method: "POST" })
@@ -69,15 +81,7 @@ toggleBtn.onclick = () => {
 
 // System mode change
 systemMode.addEventListener("change", async () => {
-    document.getElementById("videoStream").src = "";
-
-    hideOverlay();
-    enrollmentActive = false;
-
-    updateModeUI(systemMode.value);
-
-    await fetch(`/system/mode/${systemMode.value}`, { method: "POST" });
-    document.getElementById("videoStream").src = "/video_feed";
+    await setMode(systemMode.value, { stopEnrollment: true });
 });
 
 /* Overlay helper */
@@ -87,6 +91,9 @@ function showOverlay(msg, color="#00ff99") {
     overlayMessage.style.color = color;
     overlayMessage.style.fontSize = "40px";
     overlayMessage.style.fontWeight = "600";
+    // Keep the message away from pose debug text.
+    overlayMessage.style.top = "auto";
+    overlayMessage.style.bottom = "20px";
     overlayMessage.style.display = "block";
 }
 
@@ -149,6 +156,17 @@ async function captureLoop() {
         const res = await fetch("/enroll/capture", { method: "POST" });
         const data = await res.json();
 
+        if (data.status === "calibrating") {
+            // Calibration is expected at the beginning.
+            const count = data.calib_count !== undefined ? data.calib_count : "";
+            const suffix = count !== "" ? ` (${count})` : "";
+            const hint = data.hint ? ` - ${data.hint}` : "";
+            setEnrollStatus((data.message || "Calibrating...") + hint + suffix, "#00ff99");
+            setConfirmState(false);
+            setTimeout(captureLoop, 250);
+            return;
+        }
+
         if (data.status === "duplicate") {
             setEnrollStatus("Person already exists. Restarting enrollment", "#ff4444");
             setConfirmState(false);
@@ -157,17 +175,20 @@ async function captureLoop() {
         }
 
         if (data.status === "ok") {
-            setEnrollStatus(`${poses[data.count - 1]} (${data.count}/10) | Quality ${data.quality}`);
+            const total = data.samples_required || poses.length;
+            const poseLabel = poses[Math.min(data.count - 1, poses.length - 1)] || "Capture";
+            const notice = data.notice ? ` | ${data.notice}` : "";
+            setEnrollStatus(`${poseLabel} (${data.count}/${total}) | Quality ${data.quality}${notice}`);
             setConfirmState(data.done);
 
             if (!data.done) {
-                setTimeout(captureLoop, 400);
+                setTimeout(captureLoop, 250);
             } else {
                 setEnrollStatus("Capture complete. Click Confirm");
             }
         } else {
             setEnrollStatus(data.message || "Error during capture", "#ff4444");
-            setTimeout(captureLoop, 500);
+            setTimeout(captureLoop, 350);
         }
     } catch (err) {
         console.error(err);
@@ -177,9 +198,9 @@ async function captureLoop() {
 
 // Enrollment buttons
 document.getElementById("startEnrollment").addEventListener("click", async () => {
-    // FORCE mode switch
+    // Switch mode without racing the change handler.
     systemMode.value = "enrollment";
-    systemMode.dispatchEvent(new Event("change"));
+    await setMode("enrollment", { stopEnrollment: true });
 
     await fetch("/enroll/start", { method: "POST" });
 
@@ -209,7 +230,7 @@ document.getElementById("confirmEnrollment").addEventListener("click", async () 
     setEnrollStatus("Enrollment successful.");
 
     systemMode.value = "recognition";
-    systemMode.dispatchEvent(new Event("change"));
+    await setMode("recognition", { stopEnrollment: true });
 });
 
 // Force correct UI on page load

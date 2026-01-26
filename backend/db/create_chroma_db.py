@@ -1,6 +1,7 @@
 # backend/db/create_chroma_db.py
 
 import chromadb
+from chromadb.config import Settings
 
 # ---------- Config ----------
 PERSIST_DIR = "backend/db/chromadb_data"  # path for persistent ChromaDB
@@ -9,7 +10,10 @@ COLLECTION_NAME = "face_embeddings"
 # ---------- Create Persistent ChromaDB ----------
 def create_chroma_db():
     # Initialize persistent client
-    client = chromadb.PersistentClient(path=PERSIST_DIR)
+    client = chromadb.PersistentClient(
+        path=PERSIST_DIR,
+        settings=Settings(anonymized_telemetry=False),
+    )
 
     # Create collection if it doesn't exist
     try:
