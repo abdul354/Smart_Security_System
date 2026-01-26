@@ -34,6 +34,11 @@ pip install -r requirements.txt
 ### 2) Configure environment variables
 Create a `.env` file in the project root (it is ignored by git).
 
+Start from the template:
+```bash
+copy .env.example .env
+```
+
 Required (Supabase):
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
@@ -52,7 +57,7 @@ Optional (Rate limiting):
 
 Note: localhost (127.0.0.1 / ::1) is not rate-limited by default.
 
-See the `.env` template in the repo for all fields.
+See `.env.example` in the repo for all fields.
 
 ### 3) Create Supabase tables
 Run the SQL in:
