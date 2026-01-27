@@ -112,6 +112,11 @@ def _camera_src_disabled() -> bool:
     value = raw.strip().lower()
     return value in {"", "none", "null", "disabled", "off", "false"}
 
+
+def _dummy_camera_enabled() -> bool:
+    raw = os.environ.get("CAMERA_DUMMY", "0")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 LAST_BOXES = []
 LAST_BOXES_AGE = 0
 
@@ -372,6 +377,22 @@ def gen_frames():
                     time.sleep(0.01)
                     continue
 
+        def gen_dummy_frames():
+            """Yield a simple placeholder MJPEG stream when no real camera is available."""
+            while not CAMERA_STOP_EVENT.is_set():
+                frame = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "Dummy camera feed", (30, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame, "Set CAMERA_SRC to enable", (30, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+
+                ok, buffer = cv2.imencode('.jpg', frame)
+                if not ok:
+                    time.sleep(0.2)
+                    continue
+                frame_bytes = buffer.tobytes()
+                yield (b"--frame\r\n"
+                       b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+                time.sleep(0.2)
+
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
@@ -443,11 +464,18 @@ async def set_system_mode(mode: str):
 @app.get("/video_feed")
 def video_feed():
     if _camera_src_disabled():
+        if _dummy_camera_enabled():
+            CAMERA_STOP_EVENT.clear()
+            return StreamingResponse(
+                gen_dummy_frames(),
+                media_type="multipart/x-mixed-replace; boundary=frame",
+            )
         return JSONResponse(
             status_code=503,
             content={
                 "error": "camera_disabled",
                 "message": "Camera is disabled. Set CAMERA_SRC (e.g. 0 for local webcam, or rtsp://... in cloud).",
+                "hint": "Set CAMERA_DUMMY=1 to serve a placeholder feed.",
             },
         )
 
