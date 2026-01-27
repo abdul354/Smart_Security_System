@@ -4,10 +4,15 @@ from backend.config import (
     DETECTION_MIN_CONFIDENCE,
 )
 
-import mediapipe as mp
-
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
+try:
+    # Try standard mediapipe import first
+    import mediapipe as mp
+    mp_face_detection = mp.solutions.face_detection
+    mp_drawing = mp.solutions.drawing_utils
+except (ImportError, AttributeError):
+    # Fallback: direct import from mediapipe.solutions
+    from mediapipe.solutions import face_detection as mp_face_detection
+    from mediapipe.solutions import drawing_utils as mp_drawing
 
 face_detector = mp_face_detection.FaceDetection(
     model_selection=DETECTION_MODEL_SELECTION,
