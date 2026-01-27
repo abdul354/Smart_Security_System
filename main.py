@@ -475,24 +475,47 @@ def video_feed():
 # Recognition Info Endpoint
 @app.get("/recognition/live")
 async def recognition_live():
-    now = time.time()
+    try:
+        now = time.time()
 
-    with STATE_LOCK:
-        if now - LAST_RECOGNITION_TIME > 3:
-            faces = []
-        else:
-            faces = LAST_RECOGNITIONS.copy()
+        with STATE_LOCK:
+            if now - LAST_RECOGNITION_TIME > 3:
+                faces = []
+            else:
+                faces = LAST_RECOGNITIONS.copy()
 
-        for f in faces:
-            if f["display_name"] != "Unknown":
-                log_attendance(f["person_id"])
+            for f in faces:
+                if f["display_name"] != "Unknown":
+                    try:
+                        log_attendance(f["person_id"])
+                    except Exception as e:
+                        logger.warning(f"Failed to log attendance: {e}")
 
-    attendance = read_attendance()
-    return JSONResponse({
-        "faces": faces,
-        "attendance": attendance,
-        "metrics": metrics_snapshot(),
-    })
+        try:
+            attendance = read_attendance()
+        except Exception as e:
+            logger.warning(f"Failed to read attendance: {e}")
+            attendance = []
+
+        try:
+            metrics = metrics_snapshot()
+        except Exception as e:
+            logger.warning(f"Failed to get metrics: {e}")
+            metrics = {}
+
+        return JSONResponse({
+            "faces": faces,
+            "attendance": attendance,
+            "metrics": metrics,
+        })
+    except Exception as e:
+        logger.error(f"Error in recognition_live: {e}", exc_info=True)
+        return JSONResponse({
+            "faces": [],
+            "attendance": [],
+            "metrics": {},
+            "error": str(e)
+        }, status_code=500)
 
 
 # Enrollment Start
