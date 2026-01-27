@@ -4,8 +4,8 @@ numpy==1.26.4
 opencv-python==4.9.0.80
 groq
 
-# Face Detection
-mediapipe>=0.10.13
+# Face Detection (pin to keep solutions API available)
+mediapipe==0.10.14
 
 # Face Embeddings
 onnxruntime>=1.17.0
