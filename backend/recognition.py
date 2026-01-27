@@ -12,9 +12,23 @@ client = chromadb.PersistentClient(
     path=CHROMA_PATH,
     settings=Settings(anonymized_telemetry=False),
 )
-collection = client.get_collection("face_embeddings")
 
 logger = logging.getLogger("smart_security.recognition")
+
+_collection = None
+
+def _get_collection():
+    """Get or create the face_embeddings collection."""
+    global _collection
+    if _collection is not None:
+        return _collection
+    try:
+        _collection = client.get_collection("face_embeddings")
+    except ValueError:
+        # Collection doesn't exist, create it
+        _collection = client.create_collection("face_embeddings")
+        logger.info("Created face_embeddings collection")
+    return _collection
 
 _PERSON_CACHE = {}
 _PERSON_CACHE_AT = 0.0
@@ -57,6 +71,7 @@ def recognize_face(embedding):
             return None, None
 
     try:
+        collection = _get_collection()
         res = collection.query(query_embeddings=[embedding], n_results=1)
     except Exception as exc:
         logger.warning("Chroma query failed: %s", exc)

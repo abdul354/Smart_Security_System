@@ -5,14 +5,27 @@ import numpy as np
 import chromadb
 from chromadb.config import Settings
 from backend.config import CHROMA_PATH, SAMPLES_REQUIRED
-from backend.recognition import recognize_face
 from backend.supabase_db import upsert_person
+from backend.recognition import recognize_face
 
 client = chromadb.PersistentClient(
     path=CHROMA_PATH,
     settings=Settings(anonymized_telemetry=False),
 )
-collection = client.get_collection("face_embeddings")
+
+_collection = None
+
+def _get_collection():
+    """Get or create the face_embeddings collection."""
+    global _collection
+    if _collection is not None:
+        return _collection
+    try:
+        _collection = client.get_collection("face_embeddings")
+    except ValueError:
+        # Collection doesn't exist, create it
+        _collection = client.create_collection("face_embeddings")
+    return _collection
 
 # Enrollment session state
 CURRENT_SESSION = {
@@ -109,6 +122,7 @@ def finalize_enrollment(display_name, role, department, access_status):
 
     pid = CURRENT_SESSION["person_id"]
 
+    collection = _get_collection()
     collection.add(
         embeddings=[centroid.tolist()],
         metadatas=[

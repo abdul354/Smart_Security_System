@@ -73,8 +73,12 @@ def main() -> int:
     if args.lan:
         args.host = "0.0.0.0"
 
+    # Always ensure Chroma collection exists before starting the app
+    _ensure_chroma_collection()
+    
     if args.init_chroma:
-        _ensure_chroma_collection()
+        # This flag is now redundant but kept for backward compatibility
+        pass
 
     if args.open:
         # Give Uvicorn a moment to start listening.
