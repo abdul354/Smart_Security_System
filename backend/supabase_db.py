@@ -20,8 +20,15 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _is_supabase_configured() -> bool:
+    """Check if Supabase is configured."""
+    return bool(os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_ROLE_KEY"))
+
+
 @lru_cache(maxsize=1)
 def get_supabase() -> Client:
+    if not _is_supabase_configured():
+        raise SupabaseConfigError("Supabase is not configured")
     url = _require_env("SUPABASE_URL")
     key = _require_env("SUPABASE_SERVICE_ROLE_KEY")
     return create_client(url, key)

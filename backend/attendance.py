@@ -69,7 +69,14 @@ def read_attendance(today_only: bool = True) -> List[Dict[str, Any]]:
             if _ATTENDANCE_CACHE and (time.time() - _ATTENDANCE_CACHE_AT) < _ATTENDANCE_CACHE_TTL:
                 return [dict(row) for row in _ATTENDANCE_CACHE]
 
-    rows = _read_attendance_supabase(today_only=today_only)
+    try:
+        rows = _read_attendance_supabase(today_only=today_only)
+    except Exception as e:
+        # If Supabase is not available, return empty list
+        import logging
+        logging.warning(f"Failed to read attendance from Supabase: {e}")
+        rows = []
+    
     if today_only:
         for row in rows:
             row.setdefault("synced", True)
