@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  smart-security:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    volumes:
+      # Persist local ChromaDB + CSVs on the host
+      - ./backend/db:/app/backend/db
+    restart: unless-stopped

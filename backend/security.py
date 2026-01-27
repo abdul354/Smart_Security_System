@@ -45,6 +45,10 @@ def _unauthorized() -> Response:
 
 
 async def basic_auth_middleware(request: Request, call_next):
+    # Allow unauthenticated health checks for hosting platforms.
+    if request.url.path in {"/health", "/ready"}:
+        return await call_next(request)
+
     creds = _get_basic_credentials_from_env()
     if creds is None:
         return await call_next(request)  # auth disabled

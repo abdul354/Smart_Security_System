@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -38,10 +39,23 @@ import atexit
 import threading
 import uuid
 import logging
+import os
 from collections import deque
 import traceback
 
 app = FastAPI(title="Smart Security System Backend")
+
+_cors_origins_raw = os.environ.get("CORS_ORIGINS", "").strip()
+if _cors_origins_raw:
+    origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
 logger = logging.getLogger("smart_security")
 
@@ -63,6 +77,17 @@ SESSION_LOCK = threading.Lock()
 # Serve static frontend files
 app.mount("/static", StaticFiles(directory="frontend"), name="static")
 
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    # Keep lightweight: confirms the app process is up.
+    return {"status": "ready"}
+
 @app.get("/")
 def home():
     return FileResponse("frontend/home.html")
@@ -80,6 +105,12 @@ camera = None
 SYSTEM_MODE = "recognition"  # or "enrollment"
 OVERLAY_MESSAGE = ""
 OVERLAY_COLOR = (0, 0, 255)  # red by default
+
+
+def _camera_src_disabled() -> bool:
+    raw = os.environ.get("CAMERA_SRC", "0")
+    value = raw.strip().lower()
+    return value in {"", "none", "null", "disabled", "off", "false"}
 
 LAST_BOXES = []
 LAST_BOXES_AGE = 0
@@ -118,7 +149,10 @@ atexit.register(cleanup)
 def get_camera():
     global camera
     if camera is None:
-        camera = VideoCamera()
+        if _camera_src_disabled():
+            raise RuntimeError("Camera is disabled. Set CAMERA_SRC to a webcam index (0/1/2) or an rtsp/http URL.")
+        src = os.environ.get("CAMERA_SRC", "0")
+        camera = VideoCamera(src=src)
     return camera
 
 def release_camera():
@@ -408,6 +442,29 @@ async def set_system_mode(mode: str):
 
 @app.get("/video_feed")
 def video_feed():
+    if _camera_src_disabled():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "camera_disabled",
+                "message": "Camera is disabled. Set CAMERA_SRC (e.g. 0 for local webcam, or rtsp://... in cloud).",
+            },
+        )
+
+    # Fail fast if the camera can't be opened, instead of streaming an endless retry loop.
+    try:
+        get_camera()
+    except Exception as exc:
+        logger.warning("Camera unavailable: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "camera_unavailable",
+                "message": "Camera source could not be opened. Check CAMERA_SRC and network access.",
+                "detail": str(exc),
+            },
+        )
+
     CAMERA_STOP_EVENT.clear()
     return StreamingResponse(
         gen_frames(),
@@ -694,7 +751,7 @@ def _enroll_capture_impl():
         return {
             "status": "error",
             "message": OVERLAY_MESSAGE,
-            "hint": "Check backend/models/facenet.onnx is an embedding model (output should be (1,128) or similar).",
+            "hint": "Check backend/models/arcfaceresnet100-8.onnx (default) or set EMBEDDING_MODEL_PATH to a valid embedding ONNX (output like (1,128) or (1,512)).",
             "samples_required": SAMPLES_REQUIRED,
         }
 

@@ -16,11 +16,15 @@ print("Model loaded")
 dummy_face = np.random.randint(0, 255, (200, 200, 3), dtype=np.uint8)
 emb = get_embedding(dummy_face)
 
+if emb is None:
+    print("Embedding generation FAILED (returned None)")
+    raise SystemExit(2)
+
 print(f"Embedding shape: {emb.shape}")
 print(f"Embedding norm: {np.linalg.norm(emb)}")
 print(f"Sample values: {emb[:5]}")
 
-if emb.shape == (128,) and np.abs(np.linalg.norm(emb) - 1.0) < 1e-5:
+if emb.shape in ((128,), (512,)) and np.abs(np.linalg.norm(emb) - 1.0) < 1e-5:
     print("Embedding generation SUCCESS")
 else:
     print("Embedding generation FAILED")

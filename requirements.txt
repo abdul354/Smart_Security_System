@@ -14,6 +14,9 @@ onnx>=1.15.0
 # Vector Database
 chromadb==0.4.24
 
+# ChromaDB telemetry dependency (newer posthog versions changed capture() signature)
+posthog>=3.0,<4.0
+
 # Backend
 fastapi==0.110.0
 uvicorn==0.27.1

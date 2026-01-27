@@ -1,0 +1,15 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+.env.*
+
+backend/db/chromadb_data/
+backend/db/*.csv
+
+.vscode/
+.git/
+.gitignore

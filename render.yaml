@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: smart-security-system
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TRUST_PROXY
+        value: "1"
+      - key: CAMERA_SRC
+        value: "disabled"
+      # Add these in Render dashboard as "Secret" env vars:
+      # - BASIC_AUTH_USER
+      # - BASIC_AUTH_PASSWORD
+      # - SUPABASE_URL
+      # - SUPABASE_SERVICE_ROLE_KEY
+      # - GROQ_API_KEY
+      # Optional:
+      # - CAMERA_SRC (set to rtsp://... in cloud)

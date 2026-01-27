@@ -11,11 +11,15 @@ session = None
 
 def load_embedding_model():
     global session
-    model_path = os.path.join("backend", "models", "facenet.onnx")
-    if not os.path.exists(model_path):
-        # Silent return or print once? 
-        # Printing here might spam logs if called in loop, 
-        # but session check handles it.
+
+    env_path = os.getenv("EMBEDDING_MODEL_PATH")
+    candidates = [
+        env_path,
+        os.path.join("backend", "models", "arcfaceresnet100-8.onnx"),
+        os.path.join("backend", "models", "facenet.onnx"),
+    ]
+    model_path = next((p for p in candidates if p and os.path.exists(p)), None)
+    if not model_path:
         return None
     
     if session is None:
@@ -27,7 +31,30 @@ def load_embedding_model():
                 sess_options=opts,
                 providers=["CPUExecutionProvider"],
             )
-            print(f"ONNX FaceNet model loaded from {model_path}")
+
+            # Basic validation: ensure the graph exposes something that looks like an embedding.
+            output_shapes = [o.shape for o in session.get_outputs()]
+            has_embedding_like = False
+            for shape in output_shapes:
+                if not shape:
+                    continue
+                # Accept [1, D] or [D] style shapes.
+                if len(shape) == 2 and isinstance(shape[1], int) and int(shape[1]) >= 16:
+                    has_embedding_like = True
+                    break
+                if len(shape) == 1 and isinstance(shape[0], int) and int(shape[0]) >= 16:
+                    has_embedding_like = True
+                    break
+
+            if not has_embedding_like:
+                print(
+                    "Embedding model looks invalid for embeddings. "
+                    f"Path: {model_path}. Outputs: {output_shapes}."
+                )
+                session = None
+                return None
+
+            print(f"ONNX embedding model loaded from {model_path}")
         except Exception as e:
             print(f"Failed to load ONNX model: {e}")
             return None
@@ -40,6 +67,21 @@ def _pick_embedding_output(outputs: list[np.ndarray]) -> np.ndarray | None:
     for out in outputs:
         if not isinstance(out, np.ndarray):
             continue
+
+        # Allow squeezing singleton dims (e.g. (1,512,1,1) -> (512,)).
+        try:
+            squeezed = np.squeeze(out)
+        except Exception:
+            squeezed = out
+
+        if isinstance(squeezed, np.ndarray):
+            out = squeezed
+
+        # Accept [D] embeddings.
+        if out.ndim == 1 and out.shape[0] >= 16:
+            candidates.append(out.reshape(1, -1))
+            continue
+
         # Accept any (N, D) style tensor where D looks like an embedding length.
         if out.ndim == 2 and out.shape[0] >= 1 and out.shape[1] >= 16:
             candidates.append(out)
@@ -166,9 +208,10 @@ def get_embeddings(faces: Iterable[np.ndarray]) -> List[Optional[np.ndarray]]:
 
 def get_embedding(face_image):
     """
-    Generate 128-d embedding for a given face image (BGR).
-    Pre-processing: Resize to 160x160, whiten (standardize), NCHW format.
+    Generate an embedding vector for a given face image (BGR).
+    Output dimensionality depends on the loaded model (commonly 128 or 512).
     """
+    global _WARNED_BAD_MODEL
     sess = load_embedding_model()
     if sess is None:
         return None
@@ -191,6 +234,18 @@ def get_embedding(face_image):
                     "Embedding model output not recognized. "
                     "Expected something like (N, 128)/(N, 512). "
                     f"Got outputs: {shapes}."
+                )
+                _WARNED_BAD_MODEL = True
+            return None
+
+        # Guard against selecting a non-embedding tensor (e.g. detector head) that doesn't match batch size.
+        expected_batch = int(inputs[sess.get_inputs()[0].name].shape[0])
+        if emb2d.shape[0] != expected_batch:
+            if not _WARNED_BAD_MODEL:
+                shapes = [getattr(o, "shape", None) for o in outputs]
+                print(
+                    "Embedding output batch mismatch. "
+                    f"Expected batch {expected_batch}, got {emb2d.shape[0]}. Outputs: {shapes}."
                 )
                 _WARNED_BAD_MODEL = True
             return None

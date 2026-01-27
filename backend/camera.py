@@ -5,6 +5,15 @@ import time
 
 class VideoCamera:
     def __init__(self, src=0):
+        # src can be an int webcam index (0, 1, ...) or a URL (rtsp/http).
+        # Env vars are strings, so normalize common numeric strings.
+        if isinstance(src, str):
+            raw = src.strip()
+            if raw.isdigit():
+                src = int(raw)
+            else:
+                src = raw
+
         self.cap = cv2.VideoCapture(src)
 
         if not self.cap.isOpened():

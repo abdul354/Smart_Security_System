@@ -26,9 +26,25 @@ def _ensure_chroma_collection() -> None:
 
 
 def main() -> int:
+    env_host = os.environ.get("HOST")
+    env_port = os.environ.get("PORT")
+    try:
+        env_port_int = int(env_port) if env_port else None
+    except ValueError:
+        env_port_int = None
+
     parser = argparse.ArgumentParser(description="Run Smart Security System server")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-    parser.add_argument("--port", default=8001, type=int, help="Bind port (default: 8001)")
+    parser.add_argument(
+        "--host",
+        default=(env_host or "127.0.0.1"),
+        help="Bind host (default: HOST env var or 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        default=(env_port_int or 8001),
+        type=int,
+        help="Bind port (default: PORT env var or 8001)",
+    )
     parser.add_argument(
         "--lan",
         action="store_true",
@@ -81,6 +97,8 @@ def main() -> int:
         host=args.host,
         port=args.port,
         reload=args.reload,
+        proxy_headers=(os.environ.get("TRUST_PROXY") == "1"),
+        forwarded_allow_ips=("*" if os.environ.get("TRUST_PROXY") == "1" else None),
         log_level="info",
     )
     return 0
