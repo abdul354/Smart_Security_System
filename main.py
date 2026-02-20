@@ -241,7 +241,8 @@ def gen_frames():
                             if LAST_BOXES_AGE > DETECTION_HOLD_FRAMES:
                                 LAST_BOXES = []
 
-                boxes = LAST_BOXES
+                with STATE_LOCK:
+                    boxes = list(LAST_BOXES)
                 current_recognitions = []
 
                 recognition_results = [None] * len(boxes)
@@ -376,23 +377,6 @@ def gen_frames():
                     logger.warning("cv2.imencode failed; skipping frame")
                     time.sleep(0.01)
                     continue
-
-        def gen_dummy_frames():
-            """Yield a simple placeholder MJPEG stream when no real camera is available."""
-            while not CAMERA_STOP_EVENT.is_set():
-                frame = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "Dummy camera feed", (30, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2, cv2.LINE_AA)
-                cv2.putText(frame, "Set CAMERA_SRC to enable", (30, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
-
-                ok, buffer = cv2.imencode('.jpg', frame)
-                if not ok:
-                    time.sleep(0.2)
-                    continue
-                frame_bytes = buffer.tobytes()
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
-                time.sleep(0.2)
-
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
@@ -409,6 +393,28 @@ def gen_frames():
             should_release = ACTIVE_STREAMS == 0
         if should_release:
             release_camera()
+
+
+def gen_dummy_frames():
+    """Yield a simple placeholder MJPEG stream when no real camera is available."""
+    while not CAMERA_STOP_EVENT.is_set():
+        try:
+            frame = np.zeros((360, 640, 3), dtype=np.uint8)
+            cv2.putText(frame, "Dummy camera feed", (30, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, "Set CAMERA_SRC to enable", (30, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+
+            ok, buffer = cv2.imencode('.jpg', frame)
+            if not ok:
+                time.sleep(0.2)
+                continue
+            frame_bytes = buffer.tobytes()
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+            time.sleep(0.2)
+        except Exception:
+            logger.exception("Dummy frame loop error; continuing")
+            time.sleep(0.2)
+            continue
 
 
 def expand_box(x, y, w, h, frame_w, frame_h, margin=0.35):
